@@ -194,6 +194,8 @@ class InstanceManager:
 
         if not db_entry:
             return True
+        elif not last_scan_end:
+            return True
         else:
             old = parse_date(db_entry[0])
             new = parse_date(last_scan_end)
@@ -837,92 +839,64 @@ def status(version):
         % (args.task, args.autofp, int(args.overrides), int(args.apply_overrides))
 
     if args.use_asset_management:
-        report = conn.get_reports(
-            type='assets', host=args.hostaddress,
-            filter='sort-reverse=id result_hosts_only=1 min_cvss_base= '
-                   'min_qod= levels=hmlgd autofp=%s notes=0 apply_overrides=%s overrides=%s'
-                   ' first=1 rows=-1 delta_states=cgns'
-                   % (args.autofp, int(args.apply_overrides), int(args.overrides)))
+        # Get last complete report, ignore incomplete reports for running scans.
+        report_pos=0
+        last_scan_end = None
+        while not last_scan_end:
+            report_pos += 1
+            report = conn.get_reports(
+                type='assets', host=args.hostaddress, pos=report_pos,
+                filter='sort-reverse=id result_hosts_only=1 status=Done min_cvss_base= '
+                       'min_qod= levels=hmlgd autofp=%s notes=0 apply_overrides=%s overrides=%s'
+                       ' first=1 rows=1 delta_states=cgns'
+                       % (args.autofp, int(args.apply_overrides), int(args.overrides)))
+            last_scan_end = report.xpath('report/report/host/end/text()')
+        else:
+            last_scan_end = last_scan_end[0]
 
         report_id = report.xpath(
             'report/report/host/detail/name[text()="report/@id"]/../value/'
             'text()')
-
-        last_scan_end = report.xpath('report/report/host/end/text()')
-
-        if last_scan_end:
-            last_scan_end = last_scan_end[0]
-
         if report_id:
             report_id = report_id[0]
         else:
             end_session('GMP UNKNOWN: Failed to get report_id'
                         ' via Asset Management', NAGIOS_UNKNOWN)
 
-        low_count = int(report.xpath(
-            'report/report/host/detail/name[text()="report/result_count/'
-            'low"]/../value/text()')[0])
-        medium_count = int(report.xpath(
-            'report/report/host/detail/name[text()="report/result_count/'
-            'medium"]/../value/text()')[0])
-        high_count = int(report.xpath(
-            'report/report/host/detail/name[text()="report/result_count/'
-            'high"]/../value/text()')[0])
+        full_report = None
+        # if last_scan_end is newer then add the report to db
+        if im.old_report(last_scan_end, params_used):
+            levels = ''
+            autofp = ''
 
-        if medium_count + high_count == 0:
-            print('GMP OK: %i vulnerabilities found - High: 0 Medium: 0 '
-                  'Low: %i' % (low_count, low_count))
+            if not args.showlog:
+                levels = 'levels=hml'
 
-            if args.report_link:
-                print('https://%s/omp?cmd=get_report&report_id=%s' %
-                      (args.hostname, report_id))
+            if args.autofp:
+                autofp = 'autofp=%i' % args.autofp
 
-            if args.scanend:
-                end = report.xpath('//end/text()')
-                if end:
-                    end = end[0]
-                else:
-                    end = 'Scan still in progress...'
-                print('SCAN_END: %s' % end)
+            full_report = conn.get_reports(
+                report_id=report_id,
+                filter='sort-reverse=id result_hosts_only=1 '
+                       'min_cvss_base= min_qod= notes=0 apply_overrides=%s overrides=%s '
+                       'first=1 rows=-1 delta_states=cgns %s %s =%s'
+                       % (int(args.apply_overrides), int(args.overrides), autofp, levels,
+                          args.hostaddress))
 
-            end_session('|High=%i Medium=%i Low=%i' %
-                        (high_count, medium_count, low_count), NAGIOS_OK)
+            full_report = full_report.xpath('report/report')
 
+            if not full_report:
+                end_session('GMP UNKNOWN: Failed to get results list.',
+                            NAGIOS_UNKNOWN)
+
+            full_report = full_report[0]
+
+            im.add_report(last_scan_end, params_used, full_report)
+            logger.debug('Report added to db')
         else:
-            full_report = None
-            # if last_scan_end is newer then add the report to db
-            if im.old_report(last_scan_end, params_used):
-                levels = ''
-                autofp = ''
+            full_report = im.load_local_report()
 
-                if not args.showlog:
-                    levels = 'levels=hml'
-
-                if args.autofp:
-                    autofp = 'autofp=%i' % args.autofp
-
-                full_report = conn.get_reports(
-                    report_id=report_id,
-                    filter='sort-reverse=id result_hosts_only=1 '
-                           'min_cvss_base= min_qod= notes=0 apply_overrides=%s overrides=%s '
-                           'first=1 rows=-1 delta_states=cgns %s %s =%s'
-                           % (int(args.apply_overrides), int(args.overrides), autofp, levels,
-                              args.hostaddress))
-
-                full_report = full_report.xpath('report/report')
-
-                if not full_report:
-                    end_session('GMP UNKNOWN: Failed to get results list.',
-                                NAGIOS_UNKNOWN)
-
-                full_report = full_report[0]
-
-                im.add_report(last_scan_end, params_used, full_report)
-                logger.debug('Report added to db')
-            else:
-                full_report = im.load_local_report()
-
-            filter_report(full_report)
+        filter_report(full_report)
 
     if args.task:
         task = conn.get_tasks(filter='permission=any owner=any rows=1 '
@@ -954,14 +928,11 @@ def status(version):
                             NAGIOS_UNKNOWN)
 
             last_report_id = last_report_id[0]
-            # pretty(task)
             last_scan_end = task.xpath(
                 'task/last_report/report/scan_end/text()')
 
             if last_scan_end:
                 last_scan_end = last_scan_end[0]
-            else:
-                last_scan_end = ''
 
             if im.old_report(last_scan_end, params_used):
                 autofp = ''
@@ -997,7 +968,7 @@ def status(version):
                     filter='sort-reverse=id result_hosts_only=1 '
                            'min_cvss_base= min_qod= levels=hmlgd autofp=%s '
                            'notes=0 apply_overrides=%s overrides=%s first=1 rows=-1 '
-                           'delta_states=cgns host=%s'
+                           'delta_states=cgns %s'
                            % (args.autofp, int(args.overrides), int(args.apply_overrides), host))
 
                 # pretty(report.xpath('report/report/filters'))
@@ -1127,7 +1098,11 @@ def filter_report(report):
         print_nvt_data(nvts)
 
     if args.scanend:
-        end = report.xpath('//end/text()')[0]
+        end = report.xpath('//end/text()')
+        if end:
+            end = end[0]
+        else:
+            end = "Scan still in progress..."
         print('SCAN_END: %s' % end)
 
     if args.details:
